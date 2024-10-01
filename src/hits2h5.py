@@ -9,6 +9,10 @@ import h5py
 from scipy.fftpack import dct,dst
 import os
 from pathlib import Path
+from typing import List
+
+import typer
+import tqdm
 
 from Ports import *
 from Ebeam import *
@@ -16,6 +20,8 @@ from Vls import *
 from Gmd import *
 from utils import *
 from config import Config, read_config
+
+from stream import stream, sink, take, item, apply
 
 def xtcav_crop(inimg,win=(256,256)):
     # hard coded factor of 2 scale down
@@ -43,270 +49,236 @@ def xtcav_crop(inimg,win=(256,256)):
     #return inimg[:win[0],:win[1]],x0,y0
     
 
-def main():
-        ############################################
-        ###### Change this to your output dir ######
-        ############################################
-
-    scratchdir = os.getenv('scratchpath')
-    expname = os.getenv('expname')
-    nshots = int(os.getenv('nshots'))
-    
-
-    if len(sys.argv)<2:
-        print('export scratchpath=<apth to file/h5files')
-        print('export expname=tmox42619')
-        print('export nshots=100')
-        print('export configfile=<path/to/config.yaml>')
-        print('syntax: ./hits2h5.py <list of run numbers>')
-        return
-    runnums = [int(run) for run in sys.argv[1:]]
-    _ = [print('runnum %i'%int(r)) for r in runnums ]
-    outnames = ['%s/hits.%s.run_%03i.h5'%(scratchdir,expname,r) for r in runnums]
-
-    _=[print('starting analysis exp %s for run %i'%(expname,int(r))) for r in runnums]
-    #cfgname = '%s/%s.hsdconfigs.h5'%(scratchdir,expname)
-    cfgname = os.getenv('configfile')
+def main(cfgname : Path,
+         scratchdir : Path,
+         nshots : int,
+         expname : str,
+         runnums : List[int]) -> None:
+    #    print('scratchpath=<path to file/h5files>')
+    #    print('expname=tmox42619')
+    #    print('nshots=100')
+    #    print('configfile=<path/to/config.h5>')
+    #    print('syntax: ./hits2h5.py <list of run numbers>')
     params = read_config(cfgname)
+
+    # TODO: parallelize this loop
+    for run in runnums:
+        outname = scratchdir/f"hits.{expnname}.run_{run:03d}.h5"
+        handle_run(run, outname, params)
+        print('Finished with run %d'%run)
+    print("Hello, I'm done now!")
+
+def handle_run(run : int, outname : Path, params : Config,
+                runhsd = True
+                runvls = True
+                runebeam = True
+                runxtcav = False
+                rungmd = True
+              ) -> None
     chans = params.chans
     t0s = params.t0s
     logicthresh = params.logicthresh
-
     nr_expand = params.expand
-
-
-    spect = [Vls(params.vlsthresh) for r in runnums]
-    _ = [s.setwin(*params.vlswin) for s in spect]
-    #_ = [s.setthresh(params.vlsthresh) for s in spect]
-    ebunch = [Ebeam() for r in runnums]
-    gmd = [Gmd() for r in runnums]
-    _ = [e.setoffset(params.l3offset) for e in ebunch]
-    port = [{} for r in runnums] 
     inflate = params.inflate
 
-    for r in range(len(runnums)):
-        for key in chans.keys():
-            port[r][key] = Port(key,chans[key],t0=t0s[key],logicthresh=logicthresh[key],inflate=inflate,expand=nr_expand,nrolloff=2**6)
+    #_ = [print('runnum %i'%int(r)) for r in runnums ]
 
-    ds = [psana.DataSource(exp=expname,run=r) for r in runnums]
+    print('starting analysis exp %s for run %d'%(expname,run)
+    #cfgname = '%s/%s.hsdconfigs.h5'%(scratchdir,expname)
 
+    spect = Vls(params.vlsthresh)
+    #spect.setthresh(params.vlsthresh)
+    spect.setwin(*params.vlswin)
+    ebunch = Ebeam()
+    gmd = Gmd()
+    ebunch.setoffset(params.l3offset)
+    port = { key: Port(key, chan,
+                       t0 = t0s[key],
+                       logicthresh = logicthresh[key],
+                       inflate = inflate,
+                       expand = nr_expand,
+                       nrolloff = 2**6)
+             for key, chan in chans.items() }
+
+    ds = psana.DataSource(exp=expname,run=run)
     #for run in ds.runs():
-    runs = [next(ds[r].runs()) for r in range(len(runnums))]
-        #np.savetxt('%s/waveforms.%s.%i.%i.dat'%(scratchdir,expname,runnum,key),wv[key],fmt='%i',header=headstring)
-    for r in range(len(runnums)):
-        print(runs[r].detnames)
-    runhsd=True
-    runvls=True
-    runebeam=True
-    runxtcav=False
-    rungmd=True
-    hsds = []
-    vlss = []
-    ebeams = []
-    xtcavs = []
-    xgmds = []
-    for r in range(len(runnums)):
-        eventnum = 0
-        print('processing run %i'%runnums[r])
-        if runhsd and 'hsd' in runs[r].detnames:
-            hsds += [runs[r].Detector('hsd')]
-        if runvls and 'andor' in runs[r].detnames:
-            vlss += [runs[r].Detector('andor')]
-        if runebeam and 'ebeam' in runs[r].detnames:
-            ebeams += [runs[r].Detector('ebeam')]
-        if runxtcav and 'xtcav' in runs[r].detnames:
-            xtcavs += [runs[r].Detector('xtcav')]
-        if rungmd and 'xgmd' in runs[r].detnames:
-            xgmds += [runs[r].Detector('xgmd')]
+    runs = next(ds.runs())
+    #np.savetxt('%s/waveforms.%s.%i.%i.dat'%(scratchdir,expname,runnum,key),wv[key],fmt='%i')#,header=headstring)
+    print("detectors: ", runs.detnames)
 
-        wv = {}
-        wv_logic = {}
-        v = [] # vls data matrix
-        vc = [] # vls centroids vector
-        vs = [] # vls sum is I think not used, maybe for normalization or used to be for integration and PDF sampling
-        l3 = [] # e-beam l3 (linac 3) in GeV.
+    hsd = None
+    vls = None
+    ebeam = None
+    xtcav = None
+    xgmd = None
+
+    eventnum = 0
+    print('processing run %d'%run)
+    if runhsd and 'hsd' in runs.detnames:
+        hsd=runs.Detector('hsd')
+    if runvls and 'andor' in runs.detnames:
+        vls=runs.Detector('andor')
+    if runebeam and 'ebeam' in runs.detnames:
+        ebeam=runs.Detector('ebeam')
+    if runxtcav and 'xtcav' in runs.detnames:
+        xtcav=runs.Detector('xtcav')
+    if rungmd and 'xgmd' in runs.detnames:
+        xgmd=runs.Detector('xgmd')
+
+    print('chans: ',chans)
+    def show(eventnum, img):
+        print('working event %i,\tnedges = %s'%(eventnum,
+                    [port[k].getnedges() for k in chans.keys()] ))
+        return eventnum, img
+
+    data = Data(chans, port)
+
+    run = process(chans,port,hsd,vls,ebeam,xtcav,xgmd) \
+            >> apply(show) \
+            >> apply(data.append) \
+            >> write_h5(outname, port, chans)
+
+    src = enumerate(runs.events)
+    if nshots is not None: # truncate to nshots
+        src = src >> take(nshots)
+    # save ea. 100 of the first 1000
+    src >> item[100:1000:100] >> run
+    # save ea. 1000 of the remaining
+    src >> item[::1000] >> run
+
+@sink
+def write_h5(data, outname, port, chans):
+    for (events, spect, ebunch, gmd) in data:
+        with h5py.File(outname,'w') as f:
+            print('writing to %s'%outname)
+            if runhsd:
+                Port.update_h5(f,port,events,chans)
+            if runvls:
+                Vls.update_h5(f,spect,events)
+            if ebeam:
+                Ebeam.update_h5(f,ebunch,events) # ?ebeam
+            if gmd:
+                Gmd.update_h5(f,gmd,events)
+
+class Data:
+    def __init__(self, chans, port):
+        #wv = {}
+        #wv_logic = {}
+        #v = [] # vls data matrix
+        #vc = [] # vls centroids vector
+        #vs = [] # vls sum is I think not used, maybe for normalization or used to be for integration and PDF sampling
+        #l3 = [] # e-beam l3 (linac 3) in GeV.
+        self.chans = chans
+        self.port = port
+
         xtcavImages = []
         xtcavX0s = []
         xtcavY0s = []
-        xtcavEvents = []
 
-        vlsEvents = []
-        hsdEvents = []
-        ebeamEvents = []
-        gmdEvents =[]
+        self.events = []
 
-        init = True 
-        vsize = 0
+        self.init = True 
+        #vsize = 0
 
-        print('chans: ',chans)
-        for evt in runs[r].events():
-            if eventnum > nshots:
-                break
+    def append(self, eventnum, img, ebunch, spect, gmd):
+        if self.init:
+            self.init = False
+            ebunch.set_initState(False)
+            spect.set_initState(False)
+            gmd.set_initState(False)
+            for key in self.chans.keys():
+                self.port[key].set_initState(False)
+        if img is not None:
+            self.xtcavImages.append(img[0])
+            self.xtcavX0s.append(img[1])
+            self.xtcavY0s.append(img[2])
+        self.events.append(eventnum)
 
-            completeEvent = [True]
+@stream
+def process(events, chans,port,hsd,vls,ebeam,xtcav,xgmd):
+    for eventnum, evt in events:
+        completeEvent = []
 
-            if runxtcav and bool(np.prod(completeEvent)):
-                try:
-                    if type(xtcav.raw.value(evt)) == None:
-                        print(eventnum,'skip per problem with XTCAV')
-                        completeEvent += [False]
-                        continue
-                    else:
-                        img = np.copy(xtcav.raw.value(evt)).astype(np.int16)
-                        mf = np.argmax(np.histogram(img,np.arange(2**8))[0])
-                        img -= mf
-                        imgcrop,x0,y0 = xtcav_crop(img,win=(512,256))
-                        xtcavImages += [imgcrop]
-                        xtcavX0s += [x0]
-                        xtcavY0s += [y0]
-                        completeEvent += [True]
-                except:
-                    print(eventnum,'skipping xtcav, skip per failed try:')
-                    completeEvent += [False]
+        xtcav_image = None
+        if xtcav and all(completeEvent):
+            try:
+                if xtcav.raw.value(evt) is None:
+                    print(eventnum,'skip per problem with XTCAV')
                     continue
+                else:
+                    #completeEvent.append(True)
+                    xtcav_image = xtcav.raw.value(evt)
+            except Exception as e:
+                print(eventnum,'skipping xtcav, skip per err: ', e)
+                continue
 
 
 ## test vlswv
-            vlswv = None
-            if runvls and bool(np.prod(completeEvent)):
-                ''' VLS specific section, do this first to slice only good shots '''
-                if type(vlss[r]) == None:
-                    print(eventnum,'skip per problem with VLS')
-                    completeEvent += [False]
-                    continue
-                vlswv = np.squeeze(vlss[r].raw.value(evt))
-                completeEvent += [spect[r].test(vlswv)]
+        vlswv = None
+        if vls and all(completeEvent):
+            ''' VLS specific section, do this first to slice only good shots '''
+            vlswv = np.squeeze(vlss.raw.value(evt))
+            completeEvent.append(spect.test(vlswv))
 
 
 ## test thisl3
-            thisl3 = None
-            if runebeam and bool(np.prod(completeEvent)):
-                ''' Ebeam specific section '''
-                if type(ebeams[r]) == None:
-                    print(eventnum,'ebeam is None')
-                    completeEvent += [False]
-                    continue
-                thisl3 = ebeams[r].raw.ebeamL3Energy(evt)
-                completeEvent += [ebunch[r].test(thisl3)]
+        thisl3 = None
+        if ebeam and all(completeEvent):
+            ''' Ebeam specific section '''
+            thisl3 = ebeam.raw.ebeamL3Energy(evt)
+            completeEvent.append(ebunch.test(thisl3))
 
 
 ## test thisgmde
-            thisgmde = None
-            if rungmd and bool(np.prod(completeEvent)):
-                if type(xgmds[r]) == None:
-                    print(eventnum,'gmd is None')
-                    completeEvent += [False]
-                    continue
-                thisgmde = xgmds[r].raw.energy(evt)
-                completeEvent += [gmd[r].test(thisgmde)]
+        thisgmde = None
+        if gmd and all(completeEvent):
+            thisgmde = gmd.raw.energy(evt)
+            completeEvent.append(gmd.test(thisgmde))
 
 
 ## test hsds
-            if runhsd and bool(np.prod(completeEvent)):
-                if type(hsds[r]) == None:
-                    print(eventnum,'hsds is None')
-                    completeEvent += [False]
-                for key in chans.keys(): # here key means 'port number'
-                    completeEvent += [port[r][key].test(hsds[r].raw.waveforms(evt)[ chans[key] ][0])]
+        if hsd and all(completeEvent):
+            if hsd is None:
+                print(eventnum,'hsd is None')
+                completeEvent.append(False)
+            completeEvent.append(all(
+                    port[key].test(hsd.raw.waveforms(evt)[chan][0])
+                    for key, chan in chans.items()
+                                ))
+                # here key means 'port number'
 
+        if not all(completeEvent):
+            continue
+
+## process xtcav
+        img = None
+        if xtcav_image:
+            img = np.copy(xtcav_image).astype(np.int16)
+            mf = np.argmax(np.histogram(img,np.arange(2**8))[0])
+            img -= mf
+            imgcrop,x0,y0 = xtcav_crop(img,win=(512,256))
+            img = imgcrop, x0, y0
 
 ## process VLS
-            if runvls and bool(np.prod(completeEvent)):
-                spect[r].process(vlswv)
+        if vlsvw:
+            spect.process(vlswv)
 
 ## process ebeam
-            if runebeam and bool(np.prod(completeEvent)):
-                ebunch[r].process(thisl3)
+        if thisl3:
+            ebunch.process(thisl3)
 
 ## process gmd
-            if rungmd and bool(np.prod(completeEvent)):
-                gmd[r].process(thisgmde)
-
+        if thisgdme:
+            gmd.process(thisgmde)
 
 ## process hsds
-            if runhsd and bool(np.prod(completeEvent)):
-                ''' HSD-Abaco section '''
-                for key in chans.keys(): # here key means 'port number'
-                    s = np.array(hsds[r].raw.waveforms(evt)[ chans[key] ][0] , dtype=np.int16) # presumably 12 bits unsigned input, cast as int16_t since will immediately in-place subtract baseline
-                    port[r][key].process(s)
+        if hsd:
+            ''' HSD-Abaco section '''
+            for key, chan in chans.items(): # here key means 'port number'
+                s = np.array(hsd.raw.waveforms(evt)[chan][0], dtype=np.int16) # presumably 12 bits unsigned input, cast as int16_t since will immediately in-place subtract baseline
+                port[key].process(s)
 
-## redundant events vec
-            if bool(np.prod(completeEvent)):
-                if runebeam:
-                    ebeamEvents += [eventnum]
-                if runvls:
-                    vlsEvents += [eventnum]
-                if runxtcav:
-                    xtcavEvents += [eventnum]
-                if rungmd:
-                    gmdEvents += [eventnum]
-                if runhsd:
-                    hsdEvents += [eventnum]
-
-
-
-                if eventnum<2:
-                        print('ports = %s'%([k for k in chans.keys()]))
-                if eventnum<100:
-                    if eventnum%10==0: 
-                        print('working event %i,\tnedges = %s'%(eventnum,[port[r][k].getnedges() for k in chans.keys()] ))
-                elif eventnum<1000:
-                    if eventnum%100==0: 
-                        print('working event %i,\tnedges = %s'%(eventnum,[port[r][k].getnedges() for k in chans.keys()] ))
-                else:
-                    if eventnum%1000==0: 
-                        print('working event %i,\tnedges = %s'%(eventnum,[port[r][k].getnedges() for k in chans.keys()] ))
-
-
-            if init:
-                init = False
-                ebunch[r].set_initState(False)
-                spect[r].set_initState(False)
-                gmd[r].set_initState(False)
-                for key in chans.keys():
-                    port[r][key].set_initState(False)
-
-            if eventnum > 1 and eventnum <1000 and eventnum%100==0:
-                with h5py.File(outnames[r],'w') as f:
-                    print('writing to %s'%outnames[r])
-                    if runhsd:
-                        Port.update_h5(f,port[r],hsdEvents,chans)
-                    if runvls:
-                        Vls.update_h5(f,spect[r],vlsEvents)
-                    if runebeam:
-                        Ebeam.update_h5(f,ebunch[r],ebeamEvents)
-                    if rungmd:
-                        Gmd.update_h5(f,gmd[r],gmdEvents)
-
-            elif eventnum>900 and eventnum%1000==0:
-                with h5py.File(outnames[r],'w') as f:
-                    print('writing to %s'%outnames[r])
-                    if runhsd:
-                        Port.update_h5(f,port[r],hsdEvents,chans)
-                    if runvls:
-                        Vls.update_h5(f,spect[r],vlsEvents)
-                    if runebeam:
-                        Ebeam.update_h5(f,ebunch[r],ebeamEvents)
-                    if rungmd:
-                        Gmd.update_h5(f,gmd[r],gmdEvents)
-
-            eventnum += 1
- 
-
-        with h5py.File(outnames[r],'w') as f:
-            print('writing to %s'%outnames[r])
-            if runhsd:
-                Port.update_h5(f,port[r],hsdEvents,chans)
-            if runvls:
-                Vls.update_h5(f,spect[r],vlsEvents)
-            if runebeam:
-                Ebeam.update_h5(f,ebunch[r],ebeamEvents)
-            if rungmd:
-                Gmd.update_h5(f,gmd[r],gmdEvents)
-
-        print('Finished with run %i'%runnums[r])
-    print("Hello, I'm done now!")
-    return
+        yield eventnum, img
 
 if __name__ == '__main__':
-    main()
+    typer.run(main)
